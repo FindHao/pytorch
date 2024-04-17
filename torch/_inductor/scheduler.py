@@ -30,7 +30,7 @@ from torch._dynamo.utils import dynamo_timed
 from torch._inductor.metrics import get_metric_table, is_metric_table_enabled
 from torch.utils._triton import has_triton
 
-from . import comms, config, dependencies, ir, metrics
+from . import comms, config, dependencies, ir, metrics, stream_scheduler
 from .codegen.common import get_scheduling_for_device, Kernel
 from .comm_analysis import estimate_nccl_collective_runtime
 from .dependencies import Dep, MemoryDep, StarDep, WeakDep
@@ -421,6 +421,13 @@ class BaseSchedulerNode:
             hasattr(V.kernel, "args")
             and self.get_name() in V.kernel.inplace_update_buffers
         ):
+            # @Yueming TODO: fix this
+            # if config.multiple_streams:
+            #     ssgraph = V.graph.stream_graph
+            #     if ssgraph.name_mapping[input_node.get_name()] != ssgraph.name_mapping[
+            #         self.get_name()
+            #     ]:
+            #         continue
             V.graph.wrapper_code.codegen_inplace_reuse(
                 self.scheduler.name_to_node[
                     V.kernel.inplace_update_buffers[self.get_name()]
@@ -1318,9 +1325,17 @@ class Scheduler:
             # Refresh node_users and inverse_users to reflect fused nodes
             self.compute_node_users()
             self.nodes = comms.reorder_compute_and_comm_for_overlap(self.nodes)
-        self.compute_last_usage()
-        V.debug.ir_post_fusion(self.nodes)
-        V.debug.graph_diagram(self.nodes)
+        if config.multiple_streams:
+            V.debug.ir_post_fusion(self.nodes)
+            ss_graph = stream_scheduler.stream_schedule(self.nodes)
+            self.nodes = ss_graph.reorder(self.nodes)
+            # @Yueming TODO: why put this later?
+            self.compute_last_usage()
+            V.debug.graph_diagram(self.nodes)
+        else:
+            self.compute_last_usage()
+            V.debug.ir_post_fusion(self.nodes)
+            V.debug.graph_diagram(self.nodes)
         self.debug_draw_graph()
 
         # used during codegen:
