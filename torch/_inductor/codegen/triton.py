@@ -2975,7 +2975,7 @@ class TritonKernel(Kernel):
 
         return call_args
 
-    def call_kernel(self, name: str, node: Optional[IRNode] = None):
+    def call_kernel(self, name: str, node: Optional[IRNode] = None, stream_id=0, kernel_IndentedBuffer=None):
         wrapper = V.graph.wrapper_code
         call_args = self.get_call_args()
         grid: List[Any] = []
@@ -2984,6 +2984,7 @@ class TritonKernel(Kernel):
 
         if self.args.workspace_arg is not None:
             ws = self.args.workspace_arg
+            # @Yueming TODO: check if we need to add multistream here
             wrapper.generate_workspace_allocation(
                 ws.nbytes, current_device, ws.zero_fill
             )
@@ -2998,6 +2999,8 @@ class TritonKernel(Kernel):
             triton=True,
             grid_fn=self._get_grid_fn(),
             triton_meta=self.triton_meta,
+            stream_id=stream_id,
+            kernel_IndentedBuffer=kernel_IndentedBuffer
         )
 
         if self.args.workspace_arg is not None:
@@ -3510,7 +3513,51 @@ class TritonScheduling(BaseScheduling):
                     node.mark_run()
 
         self.codegen_comment(node_schedule)
-        final_kernel.call_kernel(final_kernel.kernel_name)
+        # final_kernel.call_kernel(final_kernel.kernel_name)
+        final_kernel_name = final_kernel.kernel_name
+        if config.multiple_streams:
+            for node in node_schedule:
+                if isinstance(node, scheduler.SchedulerNode):
+                    node_name = node.get_name()
+                    break
+            else:
+                raise RuntimeError(f"Cannot find node name in {node_schedule}")
+            ssnode = V.graph.stream_graph.name_mapping[node_name]
+            stream_id = ssnode.stream_id
+            # print(f"findhao-> kernel_name: {final_kernel_name}, stream_id: {stream_id}")
+            kernel_IndentedBuffer = IndentedBuffer()
+            wrapper = V.graph.wrapper_code
+            wrapper.cuda_event_dependency(node_name, kernel_IndentedBuffer)
+            if ssnode.cuda_event:
+                wrapper.cuda_event_create(node_name, kernel_IndentedBuffer)
+            # @Yueming TODO: is it safe to define 0 as the default stream?
+            if stream_id != 0:
+                if V.graph.cpp_wrapper:
+                    kernel_IndentedBuffer.writeline(f"{{")
+                else:
+                    kernel_IndentedBuffer.writeline(f"torch.cuda.set_stream(stream{stream_id}_raw)")
+                if config.multiple_streams_profiling:
+                    kernel_IndentedBuffer.writeline(f"with torch._C._profiler._RecordFunctionFast('{node_name}'):")
+                    with kernel_IndentedBuffer.indent():
+                        final_kernel.call_kernel(final_kernel_name, stream_id=stream_id,
+                                         kernel_IndentedBuffer=kernel_IndentedBuffer)
+                else:
+                    final_kernel.call_kernel(final_kernel_name, stream_id=stream_id,
+                                         kernel_IndentedBuffer=kernel_IndentedBuffer)
+                if V.graph.cpp_wrapper:
+                    kernel_IndentedBuffer.writeline(f"}}")
+                else:
+                    kernel_IndentedBuffer.writeline(f"torch.cuda.set_stream(stream0_raw)")
+            else:
+                final_kernel.call_kernel(final_kernel_name, stream_id=stream_id,
+                                         kernel_IndentedBuffer=kernel_IndentedBuffer)
+            if ssnode.cuda_event:
+                wrapper.cuda_event_record(node_name, kernel_IndentedBuffer)
+            for line in [_ for _ in kernel_IndentedBuffer.getrawvalue().split("\n") if _]:
+                V.graph.wrapper_code.writeline(line)
+        else:
+            final_kernel.call_kernel(final_kernel_name)
+
         if config.nan_asserts:
             final_kernel.codegen_nan_check()
         if config.warn_mix_layout:
